@@ -32,6 +32,10 @@ module.exports = {
     dashboard: {
       url: "http://localhost:24012/rpc"
     },
+    goerli: {
+      url: `https://goerli.infura.io/v3/${process.env.INFURA_KEY}`,
+      accounts: [process.env.PK]
+    },
     mainnet: {
       url: `https://mainnet.infura.io/v3/${process.env.INFURA_KEY}`
     }

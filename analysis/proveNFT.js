@@ -12,26 +12,22 @@ const { rlpEncodeProof } = require('./libRlp');
 //const web3 = new Web3("http://127.0.0.1:6545");
 const web3 = new Web3(`https://mainnet.infura.io/v3/${process.env.INFURA_KEY}`);
 
-async function validateStorage(proof, slot) {
-  const proofBufs = proof.storageProof[0].proof.map(toBuffer);
+async function validateStorage(proof, slot, proofIdx) {
+  const proofBufs = proof.storageProof[proofIdx].proof.map(toBuffer);
   const pTrie = await SecureTrie.fromProof(proofBufs);
-  const valid = await pTrie.checkRoot(toBuffer(proof.storageHash));
+  const valid = pTrie.checkRoot(toBuffer(proof.storageHash));
 
-  const rlpNode = await pTrie.get(toBuffer(slot));
-  const node = rlp.decode(rlpNode);
-  console.log("content at slot", slot, ethers.BigNumber.from(node).toHexString());
-  return valid
+  const rlpNode = await pTrie.get(toBuffer(web3.utils.keccak256(slot)));
+  console.log("content at slot", slot, bufferToHex(rlp.decode(rlpNode)));
+  return valid;
 }
 
-const getNFTProof = async (blockNumber, contract, slot) => {
+const getNFTProof = async (blockNumber, contract, slots) => {
   const proof = await web3.eth.getProof(
     contract,
-    [slot],
+    slots,
     blockNumber
   );
-
-  const value = web3.utils.hexToAscii(proof.storageProof[0].value);
-  console.log(value);
 
   const proofBufs = proof.storageProof[0].proof.map(toBuffer);
   const proofTrie = await SecureTrie.fromProof(proofBufs);
@@ -45,34 +41,42 @@ const getNFTProof = async (blockNumber, contract, slot) => {
 
 (async () => {
   //mainnet
-  //prove Mike Tyson
-  //Mike Tyson's address is 0x7217BC604476859303A27f111b187526231A300C
-  const contract = "0x1a92f7381b9f03921564a437210bb9396471050c"; //cool cats
-  const blockNumber = 12790738;
+  //prove Jimmy Fallon owns BAYC#599 at block height 13572667
+  //Jimmy Fallon's address is 0x0394451c1238CEC1E825229E692AA9E428C107D8
+  //transfer transaction https://etherscan.io/tx/0x25d594eab6dd5ea7c2189d2cf30b702f64ff3c75590d7c41638c9d9a55cf0f76
 
-  const block = await web3.eth.getBlock(blockNumber);
-  console.log(block);
+  const baycAddress = "0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d"; //bored apes
+  const blockNumber = 13572667;
 
-  //const blockHash = "0x0e7bd33de43c7380dd2e87f5aa51f80ff575c715c72f130b7c020e6d2f72853a"
-  const slot = web3.utils.soliditySha3({ type: "uint256", value: 2724 }, { type: "uint256", value: 2 })
+  const indexSlot = web3.utils.soliditySha3(
+    599, 3
+  );
+  const indexValue = await web3.eth.getStorageAt(baycAddress, indexSlot, blockNumber)
+  console.log("index value", indexValue);
 
+  const bnIndex = ethers.BigNumber.from(indexValue);
+  const valueSlot = ethers.BigNumber.from(web3.utils.soliditySha3(
+    2
+  )).add(bnIndex.mul(2)).sub(2).add(1);
 
-  console.log(slot);
+  console.log(indexSlot, valueSlot.toHexString());
 
-  const { proof } = await getNFTProof(blockNumber, contract, slot);
-  console.log(proof, proof.storageProof);
+  const ownerValue = await web3.eth.getStorageAt(baycAddress, valueSlot.toHexString(), blockNumber);
+  console.log("owner value", ownerValue);
+
+  const { proof } = await getNFTProof(blockNumber, baycAddress, [indexSlot, valueSlot]);
+  //console.log(proof, proof.storageProof);
+
+  console.log(proof);
 
   const accountProof = rlpEncodeProof(proof.accountProof);
-  const storageProof = rlpEncodeProof(proof.storageProof[0].proof);
+  const indexStorageProof = rlpEncodeProof(proof.storageProof[0].proof);
+  const valueStorageProof = rlpEncodeProof(proof.storageProof[1].proof);
   console.log("account: ", bufferToHex(accountProof))
-  console.log("storage:", bufferToHex(storageProof));
+  console.log("index:", bufferToHex(indexStorageProof));
+  console.log("value:", bufferToHex(valueStorageProof));
 
-  console.log(await validateStorage(proof, web3.utils.keccak256(slot)));
+  console.log(await validateStorage(proof, indexSlot, 0));
+  console.log(await validateStorage(proof, valueSlot.toHexString(), 1));
 
 })();
-
-
-  // Splice Price
-  // const contract = "0xee25f9e9f3fe1015e1f695ab50bca299aaf4dcf1";
-  // const blockNumber = 14828505;
-  // const slot = web3.utils.soliditySha3({ type: "uint256", value: 1 }, { type: "uint256", value: 0 })

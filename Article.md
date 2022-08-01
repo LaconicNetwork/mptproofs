@@ -185,39 +185,115 @@ Hello, Hardhat!
 true
 ```
 
-Creating proofs over nested structures, dynamic types like strings, or deeply buried storage slots is slightly harder because you have to be familiar with Solidity's [storage layout](https://docs.soliditylang.org/en/v0.8.15/internals/layout_in_storage.html). Finally, here is a non-trivial use case to prove that Mike Tyson owned [Cool Cat #2724](https://opensea.io/assets/ethereum/0x1a92f7381b9f03921564a437210bb9396471050c/2724) at block height [12790738](https://etherscan.io/block/12790738). The Cool Cat NFT contract is a straight-forward OpenZeppelin `ERC721Enumerable` and inherits the storage layout from [ERC721](https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v4.7.0/contracts/token/ERC721/ERC721.sol). Its `_owners` storage slot lives at index position 2, so we can compute the slot position we need to prove and validate the result as shown in the previous example:
+### A non trivial example
+
+Creating proofs over nested structures, dynamic types like strings, or deeply buried storage slots is slightly harder because you have to be familiar with Solidity's [storage layout](https://docs.soliditylang.org/en/v0.8.15/internals/layout_in_storage.html). To demonstrate that, here is a non-trivial example to prove that Jimmy Fallon owned [Bored Ape #599](https://opensea.io/assets/ethereum/0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d/599) at block height [
+13572667](https://etherscan.io/block/13572667) as he claimed during his Tonight Show [in January 22](https://www.youtube.com/watch?v=5zi12wrh5So&t=222s). The Bored Apes NFT contract inherits from OpenZeppelin's legacy V3 [enumerable ERC721 contract](https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v3.4.2/contracts/token/ERC721/ERC721.sol#L36). The data structure storing ownership information about a single token is the private `_tokenOwners` member struct that maps a token id to an index onto another dynamic array of key value mappings.
+
+To prove the ownership storage values we need to take a look at the contract's `ownerOf` implementation and its related structs. Here's a summary of the relevant parts of the [full BAYC code base](https://etherscan.deth.net/address/0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d#code):
+
+```solidity
+library EnumerableMap {
+  struct MapEntry {
+    bytes32 _key;
+    bytes32 _value;
+  }
+
+  struct Map {
+    MapEntry[] _entries;
+    // Position of the entry defined by a key in the `entries` array, plus 1
+    // because index 0 means a key is not in the map.
+    mapping (bytes32 => uint256) _indexes;
+  }
+
+  struct UintToAddressMap {
+    Map _inner;
+  }
+
+  function _get(Map storage map, bytes32 key) private view returns (bytes32) {
+    uint256 keyIndex = map._indexes[key];
+    require(keyIndex != 0, "EnumerableMap: nonexistent key"); // Equivalent to contains(map, key)
+    return map._entries[keyIndex - 1]._value; // All indexes are 1-based
+  }
+
+  function get(UintToAddressMap storage map, uint256 key) internal view returns (address) {
+    return address(uint160(uint256(_get(map._inner, bytes32(key)))));
+  }
+  //...
+}
+
+contract ERC721 is Context, ERC165, IERC721, IERC721Metadata, IERC721Enumerable {
+
+  // Mapping from holder address to their (enumerable) set of owned tokens
+  mapping (address => EnumerableSet.UintSet) private _holderTokens;
+
+  // Enumerable mapping from token ids to their owners
+  EnumerableMap.UintToAddressMap private _tokenOwners;
+
+  function ownerOf(uint256 tokenId) public view virtual override returns (address) {
+    return _tokenOwners.get(tokenId, "ERC721: owner query for nonexistent token");
+  }
+  //...
+}
+```
+
+The index mapping `_tokenOwners` is the contract's third storage member (the 1st one being part of the ERC-165 implementation) and it implicitly points to the `Map` struct via `UintToAddressMap.inner`, occupying two storage slots. By applying Solidity's [layout rules for dynamic arrays](https://docs.soliditylang.org/en/latest/internals/layout_in_storage.html#mappings-and-dynamic-arrays), the storage slot's address of the enumeration index that points to the current owner of token #599 can be computed as `const indexSlot = web3.utils.soliditySha3(599, 3);`. Querying that storage slot's value by `web3.eth.getStorageAt(baycAddress, indexSlot, blockNumber)` yields the index `0x258` at the given block height. Considering that the `Map._entries` array starts at the contract's third slot, it takes two slots to store one `MapEntry` and the indexes are 1-based we can resolve the map's `_value` member that carries the token owner's address like so: `soliditySha3(2) + (0x258 * 2) - 2 + 1`
+
+With that we can construct two storage proofs for the index and the owner's address:
 
 ```js
-const slot = web3.utils.soliditySha3(
-  //the storage position of _owners[2724]
-  { type: "uint256", value: 2724 },
-  { type: "uint256", value: 2 }
-);
+const baycAddress = "0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d";
+const blockNumber = 13572667;
+
+const indexSlot = web3.utils.soliditySha3(599, 3);
+// -> 0x7e2616eb7a75f68a32624f502cf2cabc166c302900bbdc790c2fb85cea316a21
+const indexValue = await web3.eth.getStorageAt(
+  baycAddress,
+  indexSlot,
+  blockNumber
+); //0x258
+
+const bnIndex = ethers.BigNumber.from(indexValue);
+const valueSlot = ethers.BigNumber.from(web3.utils.soliditySha3(2))
+  .add(bnIndex.mul(2))
+  .sub(2)
+  .add(1);
+// -> 0x405787fa12a823e0f2b7631cc41b3ba8828b3321ca811111fa75cd3aa3bb5f7d
 
 const proof = await web3.eth.getProof(
-  "0x1a92f7381b9f03921564a437210bb9396471050c", //the cool cat NFT contract's address
-  [slot],
-  12790738
+  baycAddress,
+  [indexSlot, valueSlot],
+  blockNumber
 );
 ```
 
-To prove the _value_ of the yielded proof, you can:
+To prove the _value_ of the yielded proof, we can:
 
 ```javascript
-const proofBufs = proof.storageProof[0].proof.map((p) => toBuffer(p));
-const pTrie = await SecureTrie.fromProof(proofBufs);
-const valid = await pTrie.checkRoot(toBuffer(proof.storageHash));
+async function validateStorage(proof, slot, proofIdx) {
+  const proofBufs = proof.storageProof[proofIdx].proof.map(toBuffer);
+  const pTrie = await SecureTrie.fromProof(proofBufs);
+  const valid = pTrie.checkRoot(toBuffer(proof.storageHash));
+  const rlpNode = await pTrie.get(toBuffer(web3.utils.keccak256(slot)));
+  console.log("content at slot", slot, bufferToHex(rlp.decode(rlpNode)));
+  return valid;
+}
 
-//retrieving the proven slot's value:
-const hashedSlot = web3.utils.keccak256(slot); //nodes are addressed by the hashes
-const value = rlp.decode(await pTrie.get(toBuffer(hashedSlot)));
-console.log(ethers.BigNumber.from(value).toHexString());
-// => 0x7217bc604476859303a27f111b187526231a300c = Mike Tyson's address
+console.log(await validateStorage(proof, indexSlot, 0));
+console.log(await validateStorage(proof, valueSlot.toHexString(), 1));
+```
+
+```
+content at slot 0x9f82913e56c1ea296cd5a3c46bc89a4073098f41767359e4c3742445923985c7 0x0258
+true
+content at slot 0xd4790f3899b463e8194660196b97cf3ff9c47008d83ca7c0e51ce406d3c784e5 \
+0x0394451c1238cec1e825229e692aa9e428c107d8 (<- Jimmy Fallon's address)
+true
 ```
 
 ## Validating proofs inside smart contracts
 
-These have been client side examples, but can also be executed inside Solidity contracts, e.g. to prove historical chain information that's not available to the contract itself. A good example can be seen at Lido Finance's [trustless ETH/stETH price pool oracles](https://github.com/lidofinance/curve-merkle-oracle) that receives price reports as a combination of block header, account and state proofs. Since proofs are submitted [as memory variables](https://github.com/lidofinance/curve-merkle-oracle/blob/main/contracts/StableSwapStateOracle.sol#L295), price updates [are relatively cheap](https://etherscan.io/tx/0xb24e20813e08f75e12e29da53f7f6c7e5dca7be68f3d3247edd4de572c527df4). Here's a contract that's built on [Lido's primitives](https://github.com/lidofinance/curve-merkle-oracle/tree/main/contracts) and verifies any given state proof. It's also [deployed on Görli](https://goerli.etherscan.io/address/0x52e357f616a13089435be73e20cffb788eb4c928#code):
+These have been client side examples, but proofs can also be validated inside Solidity contracts, e.g. to prove historical chain information that's not available to the contract itself. A good example can be seen at Lido Finance's [trustless ETH/stETH price pool oracles](https://github.com/lidofinance/curve-merkle-oracle) that receives price reports as a combination of block header, account and state proofs. Since proofs are submitted [as memory variables](https://github.com/lidofinance/curve-merkle-oracle/blob/main/contracts/StableSwapStateOracle.sol#L295), price updates [are relatively cheap](https://etherscan.io/tx/0xb24e20813e08f75e12e29da53f7f6c7e5dca7be68f3d3247edd4de572c527df4). Here's a contract that's built on [Lido's primitives](https://github.com/lidofinance/curve-merkle-oracle/tree/main/contracts) and verifies any given state proof. It's also [deployed on Görli](https://goerli.etherscan.io/address/0x52e357f616a13089435be73e20cffb788eb4c928#code):
 
 ```solidity
 // SPDX-License-Identifier: MIT
@@ -277,7 +353,7 @@ contract ProofVerifier {
 }
 ```
 
-Continuing with the proof of Mike Tyson's Cool Cat, this is how you would prepare RLP encoded versions of the proof's node array as required by the contract's method interface:
+Continuing with the proof of Jimmy Fallon's Bored Ape, this is how you would prepare RLP encoded versions of the proof's node array as required by the contract's method interface:
 
 ```javascript
 //converts an array of rlp encoded proofs to an rlp encoded array of proofs.
@@ -287,36 +363,45 @@ const rlpEncodeProof = (proof) => {
 };
 
 const rlpAccountProof = rlpEncodeProof(proof.accountProof);
-const rlpStorageProof = rlpEncodeProof(proof.storageProof[0].proof);
+const indexStorageProof = rlpEncodeProof(proof.storageProof[0].proof);
+const valueStorageProof = rlpEncodeProof(proof.storageProof[1].proof);
 ```
 
 and submit it to the contract:
 
 ```javascript
-//state root of mainnet block #12790738
-const stateRoot =
-  "0x97b58134f9ee552ed6f44920a559a9a43712703c6ef8675cd7d91d6d6dd0a247";
-const coolCatAddress = "0x1a92f7381b9f03921564a437210bb9396471050c";
+//state root of mainnet block #13572667
+const blockStateRoot =
+  "0xa710dad6c716e0b762a671865cbe0d286f158198580f4ac97c4ace95ea85ba1b";
+const baycAddress = "0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d";
 
 async function main() {
   const Verifier = await ethers.getContractFactory("ProofVerifier");
   // 0x52E357F616a13089435bE73E20CFfB788Eb4C928 on Görli:
   const verifier = Verifier.attach(process.env.CONTRACT_VERIFIER);
 
-  //"account" is the cool cat contract
+  //"account" is the bored apes contract
   const accountResult = await verifier.extractAccountFromProof(
-    coolCatAddress,
-    stateRoot,
+    baycAddress,
+    blockStateRoot,
     rlpAccountProof
   );
-  const storageResult = await verifier.extractSlotValueFromProof(
-    hashedSlot,
+  const indexResult = await verifier.extractSlotValueFromProof(
+    ethers.utils.keccak256(indexSlot),
     accountResult.storageRoot,
-    rlpStorageProof
+    rlpIndexProof
+  );
+  const valueResult = await verifier.extractSlotValueFromProof(
+    ethers.utils.keccak256(valueSlot),
+    accountResult.storageRoot,
+    rlpValueProof
   );
 
-  const slotValue = storageResult.value.toHexString();
-  console.log(accountResult, slotValue);
+  console.log(
+    accountResult,
+    indexResult.value.toHexString(),
+    valueResult.value.toHexString()
+  );
 }
 ```
 
@@ -325,12 +410,13 @@ async function main() {
   exists: true,
   nonce: BigNumber { value: "1" },
   balance: BigNumber { value: "0" },
-  storageRoot: '0x8d50072b9535f3e3c0f1a5f8e563de92109d448d19ebce7bd34d494f088c1857',
-  codeHash: '0x5fd3b6c69b3eb182044a992e9d9649d82a18df76feabcc14e2bb73748b2ed015'
+  storageRoot: '0x3f99b7df7989c11417c18b517c333ec74104e23ae76a50d578292ba3d466d77d',
+  codeHash: '0x0ba5e25e74d81bab327110c8d8b44320f50ad5c3e91a546a5c5a9b605cf653b3'
 ]
-0x7217bc604476859303a27f111b187526231a300c // <- Mike Tyson, again.
+0x0258
+0x0394451c1238cec1e825229e692aa9e428c107d8 // <- Jimmy Fallon, again.
 ```
 
-Creating [EIP-1186](https://eips.ethereum.org/EIPS/eip-1186) compatible historical cryptographic proofs as demonstrated is a rather demanding task. It requires provers to traverse their archive nodes' LevelDBs, requiring up to 16 disk operations per account and storage slot. However, since state proofs like Mike Tyson's cool cat ownership at block height 12790738 are deterministic and valid forever, one could presciently create all proofs when chain state changes and store these proofs in a giant proof index, stored on a decentralized file system's tree structure. Chain indexers or RPC relayers like Metamask could use those proofs to minimize trust on the service itself: each reply would be instantly provable by the client.
+Creating [EIP-1186](https://eips.ethereum.org/EIPS/eip-1186) compatible historical cryptographic proofs as demonstrated is a rather demanding task. It requires provers to traverse their archive nodes' LevelDBs, requiring up to 16 disk operations per account and storage slot. However, since state proofs like Jimmy Fallon's Bored Ape ownership at block height 13572667 are deterministic and valid forever, one could presciently create all proofs when chain state changes and store these proofs in a giant proof index, e.g. on a decentralized file system's tree structure. Chain indexers or RPC relayers like Metamask could use those proofs to minimize trust on the service itself: each reply would be instantly provable by the client.
 
-The Laconic Network greatly simplifies the process of generating proofs for blockchain data, saving time for developers, and avoiding the extensive recursive querying of full-node databases that would otherwise be required. 
+The Laconic Network greatly simplifies the process of generating proofs for blockchain data, saving time for developers, and avoiding the extensive recursive querying of full-node databases that would otherwise be required.
